@@ -33,9 +33,16 @@ def save_spectral_signatures(data: np.ndarray, gt: np.ndarray, out_dir: Path,spe
     target_classes = {
         "Asphalt": 1,
         "Meadows": 2, 
+        "Gravel": 3,
         "Trees": 4,
-        "Metal Sheets": 5
+        "Metal Sheets": 5,
+        "Bare Soil": 6,
+        "Bitumen": 7,
+        "Bricks": 8,
+        "Shadows": 9
     }
+    
+    cmap = plt.get_cmap('nipy_spectral', 10)
     
     plt.figure(figsize=(10, 6))
     
@@ -44,7 +51,8 @@ def save_spectral_signatures(data: np.ndarray, gt: np.ndarray, out_dir: Path,spe
         if y_coords.size > 0:
             class_pixels = data[y_coords, x_coords, :]
             mean_signature = class_pixels.mean(axis=0)
-            plt.plot(wavelengths, mean_signature, label=name, linewidth=2)
+            class_color = cmap(class_id)
+            plt.plot(wavelengths, mean_signature, label=name, color=class_color, linewidth=2)
 
     plt.title("Mean Spectral Signatures of Pavia Materials", fontsize=14)
     plt.xlabel("Wavelength (nm)", fontsize=12)
