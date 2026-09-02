@@ -54,4 +54,4 @@ if __name__ == "__main__":
     assert label.dtype == torch.long, f"Wrong label dtype: {label.dtype}"
     assert 0 <= label.item() <= 8, f"Label out of bounds: {label.item()}"
     
-    print(f"Dataset tests passed. Total samples: {len(dataset)}")
+    print(f"Passed. Total samples: {len(dataset)}")
