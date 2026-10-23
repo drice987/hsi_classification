@@ -6,55 +6,55 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data_loader import load_pavia_data, normalize_data
-from .dataset import PaviaPatchDataset
-from .model import SpatialSpectralCNN, get_device
+from .dataset import PaviaInferenceDataset
+from .model import MaskedConvolutionalAutoencoder, SSLClassifier, get_device
 
 
 def generate_prediction_map(
-    model_path: Path | str = "outputs/best_model.pth",
+    model_path: Path | str = "outputs/finetuned_model.pth",
     patch_size: int = 9,
-    batch_size: int = 256,
+    batch_size: int = 512,
     out_dir: Path | str = "outputs",
 ) -> None:
     device = get_device()
 
-    data, gt = load_pavia_data()
+    data, _ = load_pavia_data()
     norm_data = normalize_data(data)
-    dataset = PaviaPatchDataset(norm_data, gt, patch_size=patch_size)
+
+    dataset = PaviaInferenceDataset(norm_data, patch_size=patch_size)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-    model = SpatialSpectralCNN(in_channels=data.shape[-1], num_classes=9).to(device)
+    mae = MaskedConvolutionalAutoencoder(in_channels=data.shape[-1])
+    model = SSLClassifier(pretrained_encoder=mae.encoder, num_classes=9).to(device)
     model.load_state_dict(
         torch.load(model_path, map_location=device, weights_only=True)
     )
     model.eval()
 
-    all_preds = []
+    h, w, _ = data.shape
+    pred_map = np.zeros((h, w), dtype=np.uint8)
+
     with torch.no_grad():
-        for images, _ in loader:
+        for images, coords in loader:
             images = images.to(device)
             outputs = model(images)
-            predicted = torch.argmax(outputs, dim=1)
-            all_preds.append(predicted.cpu().numpy())
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()
 
-    preds_arr = np.concatenate(all_preds)
-    coords = np.array(dataset.coordinates)
-
-    pred_map = np.zeros(gt.shape, dtype=np.uint8)
-    pred_map[coords[:, 0], coords[:, 1]] = preds_arr + 1
+            y_coords, x_coords = coords[0].numpy(), coords[1].numpy()
+            pred_map[y_coords, x_coords] = preds + 1
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     cmap = plt.get_cmap("nipy_spectral", 10)
 
-    plt.figure(figsize=(6, 10))
+    plt.figure(figsize=(8, 12))
     plt.imshow(pred_map, cmap=cmap, vmin=0, vmax=9)
-    plt.title("CNN Spatial-Spectral Prediction Map")
+    plt.title("Masked Autoencoder (SSL) Full-Scene Classification")
     plt.colorbar(ticks=range(10), label="Class ID")
     plt.axis("off")
     plt.tight_layout()
 
-    plt.savefig(out_path / "cnn_prediction_map.png", dpi=300)
+    plt.savefig(out_path / "ssl_full_prediction_map.png", dpi=300)
     plt.close()
 
 
