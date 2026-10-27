@@ -2,13 +2,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from .data_loader import load_pavia_data, normalize_data, split_spatial_gt
 from .dataset import PaviaPatchDataset
-from .model import MaskedConvolutionalAutoencoder, SSLClassifier, get_device
+from .model import (
+    MaskedConvolutionalAutoencoder,
+    SSLClassifier,
+    get_device,
+    load_pretrained_mae,
+)
 
 
 def apply_few_shot_mask(
@@ -29,7 +33,7 @@ def apply_few_shot_mask(
 
 def finetune(
     epochs: int = 100,
-    batch_size: int = 128,
+    batch_size: int = 32,
     lr: float = 1e-3,
     unfreeze_epoch: int = 41,
     pretrained_weights: Path = Path("outputs/ssl_encoder_pretrained.pth"),
@@ -47,15 +51,11 @@ def finetune(
 
     train_dataset = PaviaPatchDataset(data, gt_train, patch_size=9)
     val_dataset = PaviaPatchDataset(data, gt_val, patch_size=9)
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, drop_last=True
-    )
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     mae = MaskedConvolutionalAutoencoder(in_channels=data.shape[-1])
-    mae.encoder.load_state_dict(
-        torch.load(pretrained_weights, map_location=device, weights_only=True)
-    )
+    load_pretrained_mae(mae, pretrained_weights, device)
     model = SSLClassifier(pretrained_encoder=mae.encoder, num_classes=9).to(device)
 
     for param in model.encoder.parameters():
@@ -109,9 +109,9 @@ def finetune(
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        val_acc = 100.0 * correct / total
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+        val_acc = 100.0 * correct / max(total, 1)
+        avg_train_loss = train_loss / max(len(train_loader), 1)
+        avg_val_loss = val_loss / max(len(val_loader), 1)
 
         print(
             f"Epoch {epoch:02d}/{epochs} | "

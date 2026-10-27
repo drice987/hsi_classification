@@ -1,12 +1,12 @@
+import argparse
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn, optim
 from torch.utils.data import DataLoader
 
-from .data_loader import load_pavia_data, normalize_data
+from .data_loader import load_scene, normalize_data, split_spatial_gt
 from .dataset import PaviaSSLDataset
 from .model import MaskedConvolutionalAutoencoder, get_device
 
@@ -36,6 +36,8 @@ def masked_mse_loss(
 
 
 def pretrain(
+    source_path: Path | str = "data/PaviaU.mat",
+    bbox: tuple[int, int, int, int] | None = None,
     epochs: int = 15,
     batch_size: int = 128,
     lr: float = 1e-3,
@@ -46,12 +48,17 @@ def pretrain(
     np.random.seed(42)
     device = get_device()
 
-    data, _ = load_pavia_data()
-    split_col = int(data.shape[1] * 0.75)
-    data = normalize_data(data, split_col=split_col)
+    data, gt, _, _ = load_scene(source_path, bbox=bbox)
+    valid_mask = np.any(data > 1e-4, axis=-1)
+    _, _, split_col = split_spatial_gt(gt, train_frac=0.75)
+    data = normalize_data(data, split_col=split_col, valid_mask=valid_mask)
 
-    train_dataset = PaviaSSLDataset(data[:, :split_col, :], patch_size=9)
-    val_dataset = PaviaSSLDataset(data[:, split_col:, :], patch_size=9)
+    train_dataset = PaviaSSLDataset(
+        data[:, :split_col, :], patch_size=9, valid_mask=valid_mask[:, :split_col]
+    )
+    val_dataset = PaviaSSLDataset(
+        data[:, split_col:, :], patch_size=9, valid_mask=valid_mask[:, split_col:]
+    )
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, drop_last=True
@@ -95,8 +102,8 @@ def pretrain(
                     reconstructed, images, drop_mask, criterion
                 ).item()
 
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+        avg_train_loss = train_loss / max(len(train_loader), 1)
+        avg_val_loss = val_loss / max(len(val_loader), 1)
 
         print(
             f"Epoch {epoch:02d}/{epochs} | "
@@ -106,10 +113,27 @@ def pretrain(
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.encoder.state_dict(), weights_path)
+            torch.save(model.state_dict(), weights_path)
 
     print(f"Pretraining complete. Best Val MSE: {best_val_loss:.4f} ({weights_path})")
 
 
 if __name__ == "__main__":
-    pretrain()
+    parser = argparse.ArgumentParser(
+        description="Self-Supervised Masked Autoencoder Pretraining"
+    )
+    parser.add_argument("source", nargs="?", default="data/PaviaU.mat")
+    parser.add_argument("--bbox", nargs=4, type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument(
+        "--weights", type=Path, default=Path("outputs/ssl_encoder_pretrained.pth")
+    )
+    args = parser.parse_args()
+
+    bbox_tuple = tuple(args.bbox) if args.bbox else None
+    pretrain(
+        source_path=args.source,
+        bbox=bbox_tuple,
+        epochs=args.epochs,
+        weights_path=args.weights,
+    )

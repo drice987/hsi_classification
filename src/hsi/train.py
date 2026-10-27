@@ -2,8 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from .data_loader import load_pavia_data, normalize_data, split_spatial_gt
@@ -70,9 +69,9 @@ def train(
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        val_acc = 100.0 * correct / total
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+        val_acc = 100.0 * correct / max(total, 1)
+        avg_train_loss = train_loss / max(len(train_loader), 1)
+        avg_val_loss = val_loss / max(len(val_loader), 1)
 
         print(
             f"Epoch {epoch:02d}/{epochs} | "
