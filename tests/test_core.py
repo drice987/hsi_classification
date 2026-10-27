@@ -38,7 +38,6 @@ def test_normalize_data_uses_training_statistics(
 ) -> None:
     cube, _ = synthetic_pavia
     split_col = 18
-    # Inject extreme values in validation split to verify training stats are unaffected
     cube_skewed = cube.copy()
     cube_skewed[:, split_col:, :] += 50000.0
 
@@ -47,6 +46,13 @@ def test_normalize_data_uses_training_statistics(
 
     np.testing.assert_allclose(train_region.mean(axis=0), 0.0, atol=1e-5)
     np.testing.assert_allclose(train_region.std(axis=0), 1.0, atol=1e-4)
+
+    mask = np.zeros((20, 24), dtype=bool)
+    mask[2:16, 2:16] = True
+    cube_masked = cube.copy()
+    cube_masked[~mask] = 0.0
+    norm_masked = normalize_data(cube_masked, split_col=split_col, valid_mask=mask)
+    assert np.all(norm_masked[~mask] == 0.0)
 
 
 def test_prepare_tabular_data_and_rf(
