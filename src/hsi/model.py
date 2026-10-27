@@ -1,5 +1,7 @@
+from pathlib import Path
+
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 def get_device() -> torch.device:
@@ -47,22 +49,29 @@ class SpatialSpectralCNN(nn.Module):
 
 
 class MaskedConvolutionalAutoencoder(nn.Module):
-    """Convolutional autoencoder for self-supervised spatial-spectral reconstruction."""
+    """Spectral-spatial bottleneck autoencoder for self-supervised reconstruction."""
 
-    def __init__(self, in_channels: int = 103) -> None:
+    def __init__(self, in_channels: int = 103, bottleneck_dim: int = 64) -> None:
         super().__init__()
 
         self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, bottleneck_dim, kernel_size=1),
+            nn.BatchNorm2d(bottleneck_dim),
+            nn.GELU(),
+            nn.Conv2d(bottleneck_dim, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
         )
 
         self.decoder = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, in_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(128, bottleneck_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(bottleneck_dim, in_channels, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -91,3 +100,17 @@ class SSLClassifier(nn.Module):
         x = self.pool(x)
         x = torch.flatten(x, 1)
         return self.classifier(x)
+
+
+def load_pretrained_mae(
+    mae: MaskedConvolutionalAutoencoder,
+    weights_path: Path | str,
+    device: torch.device,
+) -> MaskedConvolutionalAutoencoder:
+    """Loads either a full MAE state dict or an encoder-only state dict."""
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    if any(k.startswith("encoder.") for k in state_dict):
+        mae.load_state_dict(state_dict, strict=False)
+    else:
+        mae.encoder.load_state_dict(state_dict)
+    return mae
