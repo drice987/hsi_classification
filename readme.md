@@ -1,4 +1,4 @@
-[![Tests](https://github.com/drice987/hsi_classification/actions/workflows/test.yml/badge.svg)](https://github.com/drice987/hsi_classification/actions/workflows/test.yml)
+[![Tests](https://github.com/drice987/hsi_classification/actions/workflows/tests.yml/badge.svg)](https://github.com/drice987/hsi_classification/actions/workflows/tests.yml)
 
 # Hyperspectral Imaging Spectroscopy & Self-Supervised Learning (`hsi`)
 
