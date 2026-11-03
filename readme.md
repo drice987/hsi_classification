@@ -1,4 +1,4 @@
-[![CI](https://github.com/drice987/hsi_classification/actions/workflows/test.yml/badge.svg)](https://github.com/drice987/hsi_classification/actions/workflows/test.yml)
+[![Tests](https://github.com/drice987/hsi_classification/actions/workflows/test.yml/badge.svg)](https://github.com/drice987/hsi_classification/actions/workflows/test.yml)
 
 # Hyperspectral Imaging Spectroscopy & Self-Supervised Learning (`hsi`)
 
@@ -62,7 +62,7 @@ Spaceborne and airborne imaging spectrometers record contiguous reflectance spec
 Requires **Python 3.11+**.
 
 ```bash
-git clone [https://github.com/drice987/hsi_classification.git](https://github.com/drice987/hsi_classification.git)
+git clone https://github.com/drice987/hsi_classification.git
 cd hsi_classification
 
 python3 -m venv .venv
@@ -71,7 +71,7 @@ source .venv/bin/activate
 pip install -e ".[test]"
 ```
 
-## Core Dependencies
+### Core Dependencies
 
 - `numpy`, `scipy`, `scikit-learn`
 - `torch`
@@ -81,7 +81,7 @@ pip install -e ".[test]"
 ## Quick Start
 All CLI modules accept either a path to an EnMAP Level-2A product directory or the Pavia University `.mat` file, along with an optional `--bbox R0 R1 C0 C1` spatial crop.
 
-**1. VNIR-SWIR Continuum Spectrosocpy, Unmixing and Cross-Mission Simulation**
+### 1. VNIR-SWIR Continuum Spectroscopy, Unmixing and Cross-Mission Simulation
 ```bash
 # Run continuum removal, ATGP unmixing, SNR check, Sentinel-2 simulation, and GeoTIFF export
 python -m hsi.spectral_analysis data/enmap_sample \
@@ -93,7 +93,7 @@ python -m hsi.spectral_analysis data/enmap_sample \
 # Simulate EUMETSAT EPS-SG METimage or MTG FCI bandpasses on a spatial subset
 python -m hsi.spectral_analysis data/enmap_sample --bbox 400 800 400 800 --convolve metimage
 ```
-**2. Self-Supervised Pretraining, Clustering, and Anomaly Mapping**
+### 2. Self-Supervised Pretraining, Clustering, and Anomaly Mapping
 ```bash
 # Pretrain the masked spatial-spectral autoencoder via random patch sampling
 python -m hsi.pretrain_ssl data/enmap_sample \
@@ -108,7 +108,7 @@ python -m hsi.cluster data/enmap_sample \
     --out outputs/ssl_clusters_anomalies_10.png
 ```
 
-**3. Cloud-Native WorldCover Alignment and Few-Shot Fine-Tuning**
+### 3. Cloud-Native WorldCover Alignment and Few-Shot Fine-Tuning
 ```bash
 # Stream and reproject 10 m ESA WorldCover COGs onto the 30 m EnMAP scene grid
 python -m hsi.fetch_worldcover data/enmap_sample --out data/aligned_worldcover.tif
@@ -126,7 +126,7 @@ python -m hsi.predict data/enmap_sample \
     --out outputs/ssl_full_prediction_map.png
 ```
 
-**4. Unified Figure Generation and Supervised Baselines**
+### 4. Unified Figure Generation and Supervised Baselines
 ```bash
 # Render overview, spectroscopy, clustering, and prediction figures in one pass
 python -m hsi.visualization data/enmap_sample --mode all --convolve s2
@@ -138,13 +138,13 @@ python -m hsi.baseline data/PaviaU.mat
 python -m hsi.train data/PaviaU.mat --epochs 15
 ```
 
-### Module Overview
+## Module Overview
 | Module | Description |
 | :--- | :--- |
-| `hsi.enmap` | Memory-mapped ENMAP L2A `.BSQ`/GeoTIFF ingestion, `METADATA.XML calibration, VNIR/SWIR overlap splicing, quality bitmasking, and GeoTIFF L2B export. |
-| `hsi.fetch_worldcover` | Cloud-native /vsicurl/ streaming and mode-resmapled UTM reprojection of 10 m ESA WorldCover tiles onto EnMAP grids. |
-| `hsi.specral_analysis` | Upper convest-hull continuum removal, 3-point parabolic sub-band interpolation, ATGP/NNLS unmixing, Monte Carlo SNR analysis, and S2/S3/METimage/FCI SRF convolution. |
-| `hsi.model` | `MaskedConvlutionalAutoencoder`, `SSLClassifier`, and `SpatialSpectralCNN`. |
+| `hsi.enmap` | Memory-mapped EnMAP L2A `.BSQ`/GeoTIFF ingestion, `METADATA.XML` calibration, VNIR/SWIR overlap splicing, quality bitmasking, and GeoTIFF L2B export. |
+| `hsi.fetch_worldcover` | Cloud-native /vsicurl/ streaming and mode-resampled UTM reprojection of 10 m ESA WorldCover tiles onto EnMAP grids. |
+| `hsi.spectral_analysis` | Upper convex-hull continuum removal, 3-point parabolic sub-band interpolation, ATGP/NNLS unmixing, Monte Carlo SNR analysis, and S2/S3/METimage/FCI SRF convolution. |
+| `hsi.model` | `MaskedConvolutionalAutoencoder`, `SSLClassifier`, and `SpatialSpectralCNN`. |
 | `hsi.dataset` | `RandomSpatialPatchDataset`, `SpatialPatchDataset`, `SSLNeighborhoodDataset` (with binary mask erosion), and zero-copy `PixelInferenceDataset`. |
 | `hsi.pretrain_ssl` | Self-supervised pretraining loop over valid scene pixels. |
 | `hsi.cluster` | Center-coordinate latent K-Means clustering and contextual reconstruction RMSE anomaly mapping. |
