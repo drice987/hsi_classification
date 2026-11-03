@@ -31,6 +31,12 @@ def compute_latent_and_anomaly_maps(
     latents: list[np.ndarray] = []
     anomaly_map = np.zeros((h, w), dtype=np.float32)
 
+    center_mask = torch.zeros(
+        (1, 1, patch_size, patch_size), dtype=torch.bool, device=device
+    )
+    r0, r1 = max(0, pad - 1), min(patch_size, pad + 2)
+    center_mask[:, :, r0:r1, r0:r1] = True
+
     with torch.no_grad():
         for i in range(0, len(coords), batch_size):
             batch_coords = coords[i : i + batch_size]
@@ -51,7 +57,7 @@ def compute_latent_and_anomaly_maps(
             c_w = feat.shape[-1] // 2
             latents.append(feat[:, :, c_h, c_w].cpu().numpy())
 
-            recon = mae(tensor_patches)
+            recon = mae(tensor_patches, spatial_mask=center_mask)
             center_recon = recon[:, :, pad, pad]
             batch_rmse = (
                 torch.sqrt(torch.mean((center_true - center_recon) ** 2, dim=1))

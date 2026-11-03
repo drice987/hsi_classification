@@ -340,7 +340,7 @@ def derive_radiometric_labels(
     is_soil = (
         (~is_water) & (ndvi < 0.18) & ((swir_nir_ratio >= 0.80) | (mean_refl >= 0.15))
     )
-    is_impervious = (~is_water) & (ndvi < 0.25) & (~is_soil)
+    is_impervious = (~is_water) & (ndvi < 0.18) & (~is_soil)
 
     labels[valid_mask & is_dense_veg] = 1
     labels[valid_mask & is_sparse_veg] = 2

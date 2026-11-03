@@ -21,7 +21,7 @@ def pretrain_ssl(
     lr: float = 5e-4,
     mask_ratio: float = 0.5,
     patch_size: int = 9,
-    weights_path: Path = Path("outputs/enmap_ssl_full.pth"),
+    weights_path: Path = Path("outputs/ssl_encoder_pretrained.pth"),
 ) -> Path:
     device = get_device()
     print(f"Using compute device: {device}")
@@ -107,7 +107,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--samples-per-epoch", type=int, default=40_000)
-    parser.add_argument("--out", type=Path, default=Path("outputs/enmap_ssl_full.pth"))
+    parser.add_argument(
+        "--out", type=Path, default=Path("outputs/ssl_encoder_pretrained.pth")
+    )
     args = parser.parse_args()
 
     bbox_tuple = tuple(args.bbox) if args.bbox else None

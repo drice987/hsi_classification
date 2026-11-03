@@ -184,14 +184,8 @@ def _compute_upper_hull_continuum(
     left_idx = np.argmax(spec_win[:, :margin], axis=1)
     right_idx = (n_bands - margin) + np.argmax(spec_win[:, n_bands - margin :], axis=1)
 
-    wl_left = wl_win[left_idx][:, np.newaxis]
-    wl_right = wl_win[right_idx][:, np.newaxis]
     r_left = spec_win[rows, left_idx][:, np.newaxis]
     r_right = spec_win[rows, right_idx][:, np.newaxis]
-
-    span = np.maximum(wl_right - wl_left, 1e-5)
-    frac = np.clip((wl_win[np.newaxis, :] - wl_left) / span, 0.0, 1.0)
-    linear_secant = r_left + frac * (r_right - r_left)
 
     band_grid = np.arange(n_bands)[np.newaxis, :]
     anchored = np.where(band_grid <= left_idx[:, np.newaxis], r_left, spec_win)
@@ -207,8 +201,7 @@ def _compute_upper_hull_continuum(
             chord = r_i + frac_k[np.newaxis, :] * (anchored[:, k : k + 1] - r_i)
             hull[:, i + 1 : k] = np.maximum(hull[:, i + 1 : k], chord)
 
-    continuum = np.maximum(linear_secant, hull)
-    return np.maximum(continuum, spec_win)
+    return np.maximum(hull, spec_win)
 
 
 def compute_absorption_feature(

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.ndimage import binary_dilation
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
@@ -23,6 +24,7 @@ def apply_stratified_few_shot_split(
     nir_band_idx: int = 60,
     shots_per_class: int = 200,
     max_val_per_class: int = 2500,
+    patch_size: int = 9,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
@@ -43,24 +45,18 @@ def apply_stratified_few_shot_split(
             continue
 
         nir_vals = cube[coords[:, 0], coords[:, 1], band_idx]
-        median_val = float(np.median(nir_vals))
 
-        low_indices = np.argwhere(nir_vals <= median_val).flatten()
-        high_indices = np.argwhere(nir_vals > median_val).flatten()
+        order = np.argsort(nir_vals)
+        half = len(order) // 2
+
+        low_indices = order[:half]
+        high_indices = order[half:]
 
         n_low = shots_per_class // 2
         n_high = shots_per_class - n_low
 
-        chosen_low = rng.choice(
-            len(low_indices),
-            size=min(n_low, len(low_indices)),
-            replace=False,
-        )
-        chosen_high = rng.choice(
-            len(high_indices),
-            size=min(n_high, len(high_indices)),
-            replace=False,
-        )
+        chosen_low = rng.choice(len(low_indices), size=n_low, replace=False)
+        chosen_high = rng.choice(len(high_indices), size=n_high, replace=False)
 
         selected_train_idx = np.concatenate(
             [low_indices[chosen_low], high_indices[chosen_high]]
@@ -68,12 +64,20 @@ def apply_stratified_few_shot_split(
         selected_coords = coords[selected_train_idx]
         gt_train[selected_coords[:, 0], selected_coords[:, 1]] = c
 
-        all_indices = np.arange(len(coords))
-        remaining_indices = np.setdiff1d(all_indices, selected_train_idx)
+    buffer_radius = max(1, patch_size // 2)
+    footprint = np.ones((2 * buffer_radius + 1, 2 * buffer_radius + 1), dtype=bool)
+    train_buffer_mask = binary_dilation(gt_train > 0, structure=footprint)
 
-        val_size = min(max_val_per_class, len(remaining_indices))
-        val_sub = rng.choice(remaining_indices, size=val_size, replace=False)
-        val_coords = coords[val_sub]
+    for c in unique_classes:
+        val_candidates = np.argwhere((labels == c) & (~train_buffer_mask))
+        if len(val_candidates) == 0:
+            val_candidates = np.argwhere((labels == c) & (gt_train == 0))
+        if len(val_candidates) == 0:
+            continue
+
+        val_size = min(max_val_per_class, len(val_candidates))
+        val_sub = rng.choice(len(val_candidates), size=val_size, replace=False)
+        val_coords = val_candidates[val_sub]
         gt_val[val_coords[:, 0], val_coords[:, 1]] = c
 
     return gt_train, gt_val
@@ -89,8 +93,8 @@ def finetune(
     shots_per_class: int = 200,
     patch_size: int = 9,
     unfreeze_epoch: int = 15,
-    pretrained_weights: Path = Path("outputs/enmap_ssl_full.pth"),
-    final_weights: Path = Path("outputs/finetuned_stratified.pth"),
+    pretrained_weights: Path = Path("outputs/ssl_encoder_pretrained.pth"),
+    final_weights: Path = Path("outputs/finetuned_model.pth"),
 ) -> float:
     torch.manual_seed(42)
     np.random.seed(42)
@@ -111,7 +115,12 @@ def finetune(
     train_dataset = PaviaPatchDataset(data, gt_train, patch_size=patch_size)
     val_dataset = PaviaPatchDataset(data, gt_val, patch_size=patch_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=(len(train_dataset) % batch_size == 1),
+    )
     val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
 
     mae = MaskedConvolutionalAutoencoder(in_channels=data.shape[-1])
@@ -193,12 +202,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained",
         type=Path,
-        default=Path("outputs/enmap_ssl_full.pth"),
+        default=Path("outputs/ssl_encoder_pretrained.pth"),
     )
     parser.add_argument(
         "--weights",
         type=Path,
-        default=Path("outputs/finetuned_stratified.pth"),
+        default=Path("outputs/finetuned_model.pth"),
     )
     args = parser.parse_args()
 

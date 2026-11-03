@@ -82,13 +82,20 @@ class MaskedConvolutionalAutoencoder(nn.Module):
             nn.Conv2d(bottleneck_dim, in_channels, kernel_size=1),
         )
 
-    def forward(self, x: torch.Tensor, mask_ratio: float | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask_ratio: float | None = None,
+        spatial_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         ratio = self.mask_ratio if mask_ratio is None else mask_ratio
 
-        if self.training and ratio > 0.0:
-            b, _, h, w = x.shape
-            spatial_mask = torch.rand(b, 1, h, w, device=x.device) < ratio
+        if spatial_mask is not None:
             x_masked = torch.where(spatial_mask, self.mask_token.expand_as(x), x)
+        elif self.training and ratio > 0.0:
+            b, _, h, w = x.shape
+            rand_mask = torch.rand(b, 1, h, w, device=x.device) < ratio
+            x_masked = torch.where(rand_mask, self.mask_token.expand_as(x), x)
         else:
             x_masked = x
 
