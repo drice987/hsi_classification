@@ -1,3 +1,4 @@
+import json
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,9 +16,33 @@ ENMAP_SURFACE_CLASSES: list[str] = [
     "Dense Vegetation",
     "Sparse Vegetation",
     "Bare Soil / Rock",
-    "Impervious / Low Albedo",
+    "Built-up",
     "Water",
 ]
+
+GEOTIFF_PIXEL_SCALE_TAG: int = 33550
+GEOTIFF_TIEPOINT_TAG: int = 33922
+GEOTIFF_GEOKEY_DIR_TAG: int = 34735
+
+
+@dataclass(frozen=True)
+class GeoMetadata:
+    crs: str = "LOCAL"
+    origin_x: float = 0.0
+    origin_y: float = 0.0
+    pixel_size_x: float = 30.0
+    pixel_size_y: float = 30.0
+    geokeys: tuple[int, ...] | None = None
+
+    def crop(self, row_offset: int, col_offset: int) -> "GeoMetadata":
+        return GeoMetadata(
+            crs=self.crs,
+            origin_x=self.origin_x + col_offset * self.pixel_size_x,
+            origin_y=self.origin_y - row_offset * self.pixel_size_y,
+            pixel_size_x=self.pixel_size_x,
+            pixel_size_y=self.pixel_size_y,
+            geokeys=self.geokeys,
+        )
 
 
 @dataclass
@@ -28,6 +53,7 @@ class EnMAPScene:
     valid_mask: np.ndarray
     quality_classes: np.ndarray
     labels: np.ndarray
+    geo: GeoMetadata | None = None
 
 
 def _resolve_product_dir(path: Path) -> Path:
@@ -58,12 +84,136 @@ def _parse_envi_header(hdr_path: Path) -> dict[str, str]:
     return meta
 
 
+def _parse_geo_from_envi_hdr(hdr: dict[str, str]) -> GeoMetadata | None:
+    map_info = hdr.get("map info")
+    if not map_info:
+        return None
+    parts = [p.strip() for p in map_info.split(",")]
+    if len(parts) < 7:
+        return None
+    try:
+        proj_name = parts[0].upper()
+        ref_x = float(parts[1]) - 1.0
+        ref_y = float(parts[2]) - 1.0
+        tie_x = float(parts[3])
+        tie_y = float(parts[4])
+        dx = float(parts[5])
+        dy = float(parts[6])
+
+        crs_label = "EPSG:4326"
+        if "UTM" in proj_name and len(parts) > 7:
+            try:
+                zone = int(parts[7].strip())
+                hemisphere = parts[8].strip().upper() if len(parts) > 8 else "NORTH"
+                base = 32700 if hemisphere.startswith("S") else 32600
+                crs_label = f"EPSG:{base + zone}"
+            except ValueError:
+                crs_label = "EPSG:32632"
+        elif proj_name in ("GEOGRAPHIC", "GEOGRAPHIC LAT/LON", "LAT/LON"):
+            crs_label = "EPSG:4326"
+        else:
+            crs_label = proj_name
+
+        return GeoMetadata(
+            crs=crs_label,
+            origin_x=tie_x - ref_x * dx,
+            origin_y=tie_y + ref_y * dy,
+            pixel_size_x=dx,
+            pixel_size_y=dy,
+        )
+    except ValueError:
+        return None
+
+
+def _parse_geo_from_tiff(tif_path: Path) -> GeoMetadata | None:
+    with tifffile.TiffFile(tif_path) as tif:
+        tags = tif.pages[0].tags
+        scale_tag = tags.get(GEOTIFF_PIXEL_SCALE_TAG)
+        tie_tag = tags.get(GEOTIFF_TIEPOINT_TAG)
+        geokey_tag = tags.get(GEOTIFF_GEOKEY_DIR_TAG)
+
+        if scale_tag is None and tie_tag is None and geokey_tag is None:
+            return None
+
+        dx, dy = 30.0, 30.0
+        if scale_tag is not None and len(scale_tag.value) >= 2:
+            dx = float(scale_tag.value[0])
+            dy = float(scale_tag.value[1])
+
+        ox, oy = 0.0, 0.0
+        if tie_tag is not None and len(tie_tag.value) >= 6:
+            i_px, j_px = float(tie_tag.value[0]), float(tie_tag.value[1])
+            ox = float(tie_tag.value[3]) - i_px * dx
+            oy = float(tie_tag.value[4]) + j_px * dy
+
+        geokeys: tuple[int, ...] | None = None
+        crs = "GEOTIFF"
+        if geokey_tag is not None:
+            geokeys = tuple(int(v) for v in geokey_tag.value)
+            for idx in range(4, len(geokeys) - 3, 4):
+                if geokeys[idx] in (3072, 2048) and geokeys[idx + 1] == 0:
+                    crs = f"EPSG:{geokeys[idx + 3]}"
+                    break
+
+        return GeoMetadata(
+            crs=crs,
+            origin_x=ox,
+            origin_y=oy,
+            pixel_size_x=dx,
+            pixel_size_y=dy,
+            geokeys=geokeys,
+        )
+
+
+def export_geotiff(
+    out_path: Path | str,
+    data: np.ndarray,
+    geo: GeoMetadata | None = None,
+    band_names: list[str] | None = None,
+    nodata: float = 0.0,
+) -> Path:
+    target = Path(out_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = np.ascontiguousarray(arr.transpose(2, 0, 1))
+
+    extratags: list[tuple[int, str, int, tuple[float | int, ...], bool]] = []
+    meta_dict: dict[str, object] = {"nodata": nodata}
+    if band_names is not None:
+        meta_dict["band_names"] = band_names
+
+    if geo is not None:
+        meta_dict["crs"] = geo.crs
+        scale_vals = (float(geo.pixel_size_x), float(geo.pixel_size_y), 0.0)
+        tie_vals = (0.0, 0.0, 0.0, float(geo.origin_x), float(geo.origin_y), 0.0)
+        extratags.append((GEOTIFF_PIXEL_SCALE_TAG, "d", 3, scale_vals, True))
+        extratags.append((GEOTIFF_TIEPOINT_TAG, "d", 6, tie_vals, True))
+        if geo.geokeys is not None:
+            extratags.append(
+                (GEOTIFF_GEOKEY_DIR_TAG, "H", len(geo.geokeys), geo.geokeys, True)
+            )
+
+    tifffile.imwrite(
+        target,
+        arr,
+        photometric="minisblack",
+        description=json.dumps(meta_dict),
+        extratags=extratags,
+    )
+    return target
+
+
+def _local_tag(element: ET.Element) -> str:
+    return element.tag.split("}")[-1].lower()
+
+
 def parse_enmap_metadata(
     xml_path: Path | str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Extracts center wavelengths, FWHM, gain, and offset arrays from METADATA.XML."""
-    tree = ET.parse(Path(xml_path))
-    root = tree.getroot()
+    """Extracts band center wavelengths, FWHM, gains, and offsets from EnMAP METADATA.XML."""
+    root = ET.parse(Path(xml_path)).getroot()
 
     wavelengths: list[float] = []
     fwhms: list[float] = []
@@ -71,38 +221,35 @@ def parse_enmap_metadata(
     offsets: list[float] = []
 
     for parent in root.iter():
-        if parent.tag.split("}")[-1].lower() == "bandcharacterisation":
-            for band_node in parent:
-                if band_node.tag.split("}")[-1].lower() not in ("bandid", "band"):
+        if _local_tag(parent) == "bandcharacterisation":
+            for node in parent:
+                if _local_tag(node) not in ("bandid", "band"):
                     continue
 
-                wl_val: float | None = None
-                fwhm_val: float = 8.0
-                gain_val: float = 1e-4
-                offset_val: float = 0.0
+                band_data: dict[str, float] = {}
+                for child in node:
+                    tag = _local_tag(child)
+                    text = (child.text or "").strip()
+                    if text:
+                        try:
+                            band_data[tag] = float(text)
+                        except ValueError:
+                            pass
 
-                for child in band_node:
-                    ctag = child.tag.split("}")[-1].lower()
-                    text = child.text.strip() if child.text else ""
-                    if not text:
-                        continue
-                    try:
-                        if ctag in ("wavelengthcenterofband", "wavelength"):
-                            wl_val = float(text)
-                        elif ctag in ("fwhmofband", "fwhm"):
-                            fwhm_val = float(text)
-                        elif ctag in ("gainofband", "gain"):
-                            gain_val = float(text)
-                        elif ctag in ("offsetofband", "offset"):
-                            offset_val = float(text)
-                    except ValueError:
-                        continue
-
-                if wl_val is not None:
-                    wavelengths.append(wl_val)
-                    fwhms.append(fwhm_val)
-                    gains.append(gain_val)
-                    offsets.append(offset_val)
+                wl = band_data.get("wavelengthcenterofband") or band_data.get(
+                    "wavelength"
+                )
+                if wl is not None:
+                    wavelengths.append(wl)
+                    fwhms.append(
+                        band_data.get("fwhmofband", band_data.get("fwhm", 8.5))
+                    )
+                    gains.append(
+                        band_data.get("gainofband", band_data.get("gain", 1e-4))
+                    )
+                    offsets.append(
+                        band_data.get("offsetofband", band_data.get("offset", 0.0))
+                    )
             break
 
     if not wavelengths:
@@ -122,7 +269,6 @@ def get_atmospheric_window_mask(
     bounds_nm: tuple[float, float] = (420.0, 2400.0),
     splice_nm: float = 950.0,
 ) -> np.ndarray:
-    """Filters out deep water-vapor bands and splices the VNIR/SWIR detector overlap."""
     keep = (wavelengths >= bounds_nm[0]) & (wavelengths <= bounds_nm[1])
     for low_nm, high_nm in exclude_windows:
         keep &= ~((wavelengths >= low_nm) & (wavelengths <= high_nm))
@@ -165,7 +311,6 @@ def derive_radiometric_labels(
     valid_mask: np.ndarray,
     quality_classes: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Assigns coarse surface classes (1-5) when no external ground-truth raster is given."""
     h, w, _ = cube.shape
     labels = np.zeros((h, w), dtype=np.int64)
 
@@ -190,10 +335,10 @@ def derive_radiometric_labels(
     if quality_classes is not None:
         is_water |= quality_classes == 2
 
-    is_dense_veg = (~is_water) & (ndvi >= 0.50)
-    is_sparse_veg = (~is_water) & (ndvi >= 0.25) & (ndvi < 0.50)
+    is_dense_veg = (~is_water) & (ndvi >= 0.35)
+    is_sparse_veg = (~is_water) & (ndvi >= 0.18) & (ndvi < 0.35)
     is_soil = (
-        (~is_water) & (ndvi < 0.25) & ((swir_nir_ratio >= 0.85) | (mean_refl >= 0.18))
+        (~is_water) & (ndvi < 0.18) & ((swir_nir_ratio >= 0.80) | (mean_refl >= 0.15))
     )
     is_impervious = (~is_water) & (ndvi < 0.25) & (~is_soil)
 
@@ -212,7 +357,6 @@ def load_enmap_l2a(
     drop_water_vapor: bool = True,
     bbox: tuple[int, int, int, int] | None = None,
 ) -> EnMAPScene:
-    """Loads an EnMAP Level-2A product directory into a calibrated reflectance cube."""
     prod_path = _resolve_product_dir(Path(product_dir))
     if not prod_path.is_dir():
         raise FileNotFoundError(f"EnMAP product directory not found: {prod_path}")
@@ -226,9 +370,11 @@ def load_enmap_l2a(
     bsq_path = _find_product_file(prod_path, "SPECTRAL_IMAGE.BSQ")
     hdr_path = _find_product_file(prod_path, "SPECTRAL_IMAGE.HDR")
     tif_path = _find_product_file(prod_path, "SPECTRAL_IMAGE.TIF")
+    geo_meta: GeoMetadata | None = None
 
     if bsq_path is not None and hdr_path is not None:
         hdr = _parse_envi_header(hdr_path)
+        geo_meta = _parse_geo_from_envi_hdr(hdr)
         lines = int(hdr.get("lines", 1000))
         samples = int(hdr.get("samples", 1000))
         bands = int(hdr.get("bands", 224))
@@ -251,6 +397,7 @@ def load_enmap_l2a(
             bsq_path, dtype=dtype_str, mode="r", offset=offset, shape=mmap_shape
         )
 
+        r0, r1, c0, c1 = 0, lines, 0, samples
         if bbox is not None:
             r0, r1 = max(0, bbox[0]), min(lines, bbox[1])
             c0, c1 = max(0, bbox[2]), min(samples, bbox[3])
@@ -259,36 +406,36 @@ def load_enmap_l2a(
                     f"Bounding box {bbox} is out of bounds for shape ({lines}, {samples})."
                 )
             bbox = (r0, r1, c0, c1)
-            if interleave == "bil":
-                raw_img = np.transpose(np.array(mmap[r0:r1, :, c0:c1]), (0, 2, 1))
-            elif interleave == "bip":
-                raw_img = np.array(mmap[r0:r1, c0:c1, :])
-            else:
-                raw_img = np.transpose(np.array(mmap[:, r0:r1, c0:c1]), (1, 2, 0))
+            if geo_meta is not None:
+                geo_meta = geo_meta.crop(r0, c0)
+
+        if interleave == "bil":
+            raw_img = np.transpose(np.array(mmap[r0:r1, :, c0:c1]), (0, 2, 1))
+        elif interleave == "bip":
+            raw_img = np.array(mmap[r0:r1, c0:c1, :])
         else:
-            if interleave == "bil":
-                raw_img = np.transpose(np.array(mmap), (0, 2, 1))
-            elif interleave == "bip":
-                raw_img = np.array(mmap)
-            else:
-                raw_img = np.transpose(np.array(mmap), (1, 2, 0))
+            raw_img = np.transpose(np.array(mmap[:, r0:r1, c0:c1]), (1, 2, 0))
 
     elif tif_path is not None:
+        geo_meta = _parse_geo_from_tiff(tif_path)
         raw_img = tifffile.imread(tif_path)
         if raw_img.ndim != 3:
             raise ValueError(f"Expected 3D spectral cube, got shape {raw_img.shape}")
-        if (
-            wavelengths is not None
-            and raw_img.shape[0] == len(wavelengths)
-            or raw_img.shape[0] < raw_img.shape[1]
-            and raw_img.shape[0] < raw_img.shape[2]
-        ):
+
+        is_band_first = (
+            wavelengths is not None and raw_img.shape[0] == len(wavelengths)
+        ) or (
+            raw_img.shape[0] < raw_img.shape[1] and raw_img.shape[0] < raw_img.shape[2]
+        )
+        if is_band_first:
             raw_img = np.transpose(raw_img, (1, 2, 0))
 
         if bbox is not None:
             r0, r1 = max(0, bbox[0]), min(raw_img.shape[0], bbox[1])
             c0, c1 = max(0, bbox[2]), min(raw_img.shape[1], bbox[3])
             bbox = (r0, r1, c0, c1)
+            if geo_meta is not None:
+                geo_meta = geo_meta.crop(r0, c0)
             raw_img = raw_img[r0:r1, c0:c1, :]
     else:
         found = [p.name for p in prod_path.iterdir() if p.is_file()]
@@ -298,10 +445,10 @@ def load_enmap_l2a(
 
     n_bands = raw_img.shape[-1]
     if wavelengths is None or len(wavelengths) != n_bands:
-        wavelengths = np.linspace(420.0, 2450.0, n_bands, dtype=np.float32)
-        fwhm = np.full(n_bands, 8.5, dtype=np.float32)
-        gains = np.full(n_bands, 1e-4, dtype=np.float32)
-        offsets = np.zeros(n_bands, dtype=np.float32)
+        raise ValueError(
+            f"Metadata band count ({len(wavelengths) if wavelengths is not None else 0}) "
+            f"does not match image cube bands ({n_bands}). Check METADATA.XML parsing."
+        )
 
     if drop_water_vapor:
         good_bands = get_atmospheric_window_mask(wavelengths)
@@ -352,10 +499,19 @@ def load_enmap_l2a(
     cube[~valid_mask] = 0.0
 
     if gt_tif_path is not None:
-        ext_gt = tifffile.imread(Path(gt_tif_path))
-        if bbox is not None:
-            r0, r1, c0, c1 = bbox
-            ext_gt = ext_gt[r0:r1, c0:c1]
+        ext_gt = np.squeeze(tifffile.imread(Path(gt_tif_path)))
+
+        if ext_gt.shape != valid_mask.shape:
+            if bbox is not None:
+                r0, r1, c0, c1 = bbox
+                ext_gt = ext_gt[r0:r1, c0:c1]
+
+        if ext_gt.shape != valid_mask.shape:
+            raise ValueError(
+                f"External ground truth shape {ext_gt.shape} does not match "
+                f"scene shape {valid_mask.shape}."
+            )
+
         labels = np.where(valid_mask, ext_gt.astype(np.int64), 0)
     else:
         labels = derive_radiometric_labels(
@@ -369,4 +525,5 @@ def load_enmap_l2a(
         valid_mask=valid_mask,
         quality_classes=quality_classes,
         labels=labels,
+        geo=geo_meta,
     )

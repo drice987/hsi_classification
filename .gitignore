@@ -2,3 +2,16 @@ data/
 .DS_Store
 outputs/
 __pycache__/
+
+# Python packaging & build artifacts
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Test & coverage artifacts
+.coverage
+.coverage.*
+tests/.coverage
+htmlcov/
+.pytest_cache/

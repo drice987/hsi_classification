@@ -15,7 +15,6 @@ from .data_loader import CLASS_NAMES, load_scene, split_spatial_gt
 def prepare_tabular_data(
     data: np.ndarray, gt: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Flattens the 3D hyperspectral cube and removes unlabeled background pixels."""
     bands = data.shape[-1]
     x_flat = data.reshape(-1, bands)
     y_flat = gt.reshape(-1)
@@ -43,7 +42,6 @@ def evaluate_baseline(
     n_components: int = 30,
     class_names: list[str] | None = None,
 ) -> None:
-    """Evaluates PCA + Random Forest under random and spatially disjoint splits."""
     if class_names is None:
         class_names = CLASS_NAMES
 
@@ -97,5 +95,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     bbox_tuple = tuple(args.bbox) if args.bbox else None
-    cube, ground_truth, _, names = load_scene(Path(args.source), bbox=bbox_tuple)
-    evaluate_baseline(cube, ground_truth, class_names=names)
+    scene = load_scene(Path(args.source), bbox=bbox_tuple)
+    evaluate_baseline(scene.cube, scene.labels, class_names=scene.class_names)

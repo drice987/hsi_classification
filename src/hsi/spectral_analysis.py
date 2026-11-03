@@ -1,7 +1,7 @@
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import nnls
 from sklearn.decomposition import PCA
@@ -12,6 +12,20 @@ from sklearn.preprocessing import StandardScaler
 
 from .baseline import prepare_tabular_data
 from .data_loader import load_scene, split_spatial_gt
+from .enmap import export_geotiff
+
+
+@dataclass
+class SpectroscopyResult:
+    wavelengths: np.ndarray
+    endmembers: np.ndarray
+    window_results: dict[str, dict[str, np.ndarray]]
+    rmse_map: np.ndarray
+    valid_mask: np.ndarray
+    convolved_centers: np.ndarray | None = None
+    convolved_endmembers: np.ndarray | None = None
+    sensor_name: str | None = None
+
 
 ABSORPTION_WINDOWS: dict[str, tuple[float, float]] = {
     "chlorophyll_red_edge": (670.0, 760.0),
@@ -54,9 +68,43 @@ OLCI_VNIR_BANDS: dict[int, tuple[float, float]] = {
     17: (865.0, 20.0),
 }
 
+METIMAGE_VII_BANDS: dict[int, tuple[float, float]] = {
+    1: (443.0, 20.0),
+    2: (555.0, 20.0),
+    3: (668.0, 20.0),
+    4: (752.0, 10.0),
+    5: (763.0, 10.0),
+    6: (865.0, 20.0),
+    7: (914.0, 20.0),
+    8: (1240.0, 20.0),
+    9: (1375.0, 15.0),
+    10: (1630.0, 20.0),
+    11: (2250.0, 50.0),
+}
+
+MTG_FCI_BANDS: dict[int, tuple[float, float]] = {
+    1: (444.0, 60.0),
+    2: (510.0, 40.0),
+    3: (640.0, 50.0),
+    4: (865.0, 50.0),
+    5: (914.0, 20.0),
+    6: (1380.0, 30.0),
+    7: (1610.0, 50.0),
+    8: (2250.0, 50.0),
+}
+
 SENSOR_SRF_SPECS: dict[str, dict[int, tuple[float, float]]] = {
     "s2": SENTINEL2_MSI_BANDS,
     "s3": OLCI_VNIR_BANDS,
+    "metimage": METIMAGE_VII_BANDS,
+    "fci": MTG_FCI_BANDS,
+}
+
+SENSOR_LABELS: dict[str, str] = {
+    "s2": "Sentinel-2 MSI",
+    "s3": "Sentinel-3 OLCI",
+    "metimage": "EPS-SG METimage",
+    "fci": "MTG FCI",
 }
 
 
@@ -70,7 +118,6 @@ def build_srf_weights(
     wavelengths: np.ndarray,
     band_specs: dict[int, tuple[float, float]] = OLCI_VNIR_BANDS,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Builds a row-normalized Gaussian Spectral Response Function (SRF) matrix."""
     wl_min, wl_max = float(wavelengths.min()), float(wavelengths.max())
     weights = []
     centers = []
@@ -94,7 +141,6 @@ def build_srf_weights(
 
 
 def resample_cube(cube: np.ndarray, srf_weights: np.ndarray) -> np.ndarray:
-    """Projects a 3D hyperspectral cube onto target multispectral SRF channels."""
     h, w, c = cube.shape
     projected = cube.reshape(-1, c) @ srf_weights.T
     return projected.reshape(h, w, srf_weights.shape[0])
@@ -103,7 +149,6 @@ def resample_cube(cube: np.ndarray, srf_weights: np.ndarray) -> np.ndarray:
 def _parabolic_subband_extremum(
     values: np.ndarray, wl_axis: np.ndarray, discrete_idx: np.ndarray
 ) -> np.ndarray:
-    """Refines discrete band extrema using 3-point parabolic vertex interpolation."""
     n_samples, n_bands = values.shape
     clamped = np.clip(discrete_idx, 1, n_bands - 2)
     rows = np.arange(n_samples)
@@ -131,7 +176,7 @@ def _parabolic_subband_extremum(
 def _compute_upper_hull_continuum(
     spec_win: np.ndarray, wl_win: np.ndarray
 ) -> np.ndarray:
-    """Computes an upper envelope continuum anchored at shoulder maxima."""
+    """Computes upper envelope continuum anchored at window shoulder maxima."""
     n_pixels, n_bands = spec_win.shape
     rows = np.arange(n_pixels)
 
@@ -146,8 +191,23 @@ def _compute_upper_hull_continuum(
 
     span = np.maximum(wl_right - wl_left, 1e-5)
     frac = np.clip((wl_win[np.newaxis, :] - wl_left) / span, 0.0, 1.0)
-    continuum = r_left + frac * (r_right - r_left)
+    linear_secant = r_left + frac * (r_right - r_left)
 
+    band_grid = np.arange(n_bands)[np.newaxis, :]
+    anchored = np.where(band_grid <= left_idx[:, np.newaxis], r_left, spec_win)
+    anchored = np.where(band_grid >= right_idx[:, np.newaxis], r_right, anchored)
+
+    hull = anchored.copy()
+    for i in range(n_bands - 1):
+        wl_i = wl_win[i]
+        r_i = anchored[:, i : i + 1]
+        for k in range(i + 2, n_bands):
+            span_k = max(float(wl_win[k] - wl_i), 1e-6)
+            frac_k = (wl_win[i + 1 : k] - wl_i) / span_k
+            chord = r_i + frac_k[np.newaxis, :] * (anchored[:, k : k + 1] - r_i)
+            hull[:, i + 1 : k] = np.maximum(hull[:, i + 1 : k], chord)
+
+    continuum = np.maximum(linear_secant, hull)
     return np.maximum(continuum, spec_win)
 
 
@@ -157,7 +217,6 @@ def compute_absorption_feature(
     window_nm: tuple[float, float],
     min_continuum_refl: float = 0.05,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Computes upper-hull continuum removal and sub-band parabolic absorption minimum."""
     mask = (wavelengths >= window_nm[0]) & (wavelengths <= window_nm[1])
     if int(np.sum(mask)) < 3:
         raise ValueError(
@@ -196,7 +255,6 @@ def compute_red_edge_metrics(
     wavelengths: np.ndarray,
     window_nm: tuple[float, float] = (670.0, 760.0),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calculates continuum-removed chlorophyll depth, area, and sub-band REIP."""
     ab_metrics, wl_re, continuum_removed = compute_absorption_feature(
         spectra, wavelengths, window_nm
     )
@@ -216,12 +274,50 @@ def compute_red_edge_metrics(
     return metrics, wl_re, continuum_removed
 
 
+def evaluate_snr_sensitivity(
+    spectrum: np.ndarray,
+    wavelengths: np.ndarray,
+    window_nm: tuple[float, float] = (2160.0, 2240.0),
+    snr_levels: tuple[float, ...] = (50.0, 100.0, 200.0, 400.0, 800.0),
+    n_trials: int = 250,
+    seed: int = 42,
+) -> dict[float, dict[str, float]]:
+    spec_1d = np.asarray(spectrum, dtype=np.float32).reshape(1, -1)
+    ref_metrics, _, _ = compute_absorption_feature(spec_1d, wavelengths, window_nm)
+    true_depth = float(ref_metrics[0, 0])
+    true_wl = float(ref_metrics[0, 2])
+
+    rng = np.random.default_rng(seed)
+    results: dict[float, dict[str, float]] = {}
+
+    for snr in snr_levels:
+        sigma = np.maximum(spec_1d, 1e-4) / float(snr)
+        noisy_batch = (
+            spec_1d
+            + rng.normal(0.0, 1.0, size=(n_trials, spec_1d.shape[1])).astype(np.float32)
+            * sigma
+        )
+        noisy_batch = np.clip(noisy_batch, 1e-4, 1.5)
+
+        metrics, _, _ = compute_absorption_feature(noisy_batch, wavelengths, window_nm)
+        depth_err = metrics[:, 0] - true_depth
+        wl_err = metrics[:, 2] - true_wl
+
+        results[float(snr)] = {
+            "wavelength_rmse_nm": float(np.sqrt(np.mean(wl_err**2))),
+            "wavelength_std_nm": float(np.std(wl_err)),
+            "wavelength_bias_nm": float(np.mean(wl_err)),
+            "depth_rmse": float(np.sqrt(np.mean(depth_err**2))),
+        }
+
+    return results
+
+
 def analyze_diagnostic_windows(
     cube: np.ndarray,
     wavelengths: np.ndarray,
     windows: dict[str, tuple[float, float]] = ABSORPTION_WINDOWS,
 ) -> dict[str, dict[str, np.ndarray]]:
-    """Extracts 2D maps of band depth, area, and sub-band wavelength position."""
     h, w, c = cube.shape
     flat_spectra = cube.reshape(-1, c)
     results: dict[str, dict[str, np.ndarray]] = {}
@@ -257,7 +353,6 @@ def extract_endmembers_atgp(
     n_endmembers: int = 4,
     valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Extracts pure spectral endmembers via shape-normalized Orthogonal Subspace Projection."""
     _, _, c = cube.shape
     flat = cube.reshape(-1, c).astype(np.float64)
 
@@ -273,10 +368,11 @@ def extract_endmembers_atgp(
     full_spec_mask = band_activity >= 0.80
     water_like_mask = (band_activity > 0.15) & (band_activity < 0.80)
 
-    if np.sum(full_spec_mask) >= n_endmembers:
-        pool = valid_flat[full_spec_mask]
-    else:
-        pool = valid_flat
+    pool = (
+        valid_flat[full_spec_mask]
+        if np.sum(full_spec_mask) >= n_endmembers
+        else valid_flat
+    )
 
     norms = np.linalg.norm(pool, axis=1)
     low_cap, high_cap = np.percentile(norms, [5.0, 99.5])
@@ -293,7 +389,6 @@ def extract_endmembers_atgp(
 
     endmembers = np.zeros((n_endmembers, c), dtype=np.float64)
     unit_basis = np.zeros((n_land, c), dtype=np.float64)
-
     first_idx = int(np.argmax(np.linalg.norm(candidates, axis=1)))
 
     for k in range(n_land):
@@ -324,8 +419,8 @@ def unmix_scene_atgp(
     cube: np.ndarray,
     n_endmembers: int = 4,
     valid_mask: np.ndarray | None = None,
+    fcls_weight: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Runs ATGP endmember extraction followed by NNLS unmixing and RMSE mapping."""
     h, w, c = cube.shape
     if valid_mask is None:
         valid_mask = np.any(cube > 1e-4, axis=-1)
@@ -334,6 +429,13 @@ def unmix_scene_atgp(
         cube, n_endmembers=n_endmembers, valid_mask=valid_mask
     )
     design_matrix = endmembers.T.astype(np.float64)
+    use_fcls = fcls_weight is not None and fcls_weight > 0.0
+    if use_fcls:
+        solver_matrix = np.vstack(
+            [design_matrix, np.full((1, n_endmembers), fcls_weight, dtype=np.float64)]
+        )
+    else:
+        solver_matrix = design_matrix
 
     flat_pixels = cube.reshape(-1, c).astype(np.float64)
     valid_indices = np.nonzero(valid_mask.reshape(-1))[0]
@@ -343,12 +445,18 @@ def unmix_scene_atgp(
 
     for i in valid_indices:
         pixel = flat_pixels[i]
-        coeff, _ = nnls(design_matrix, pixel)
-        recon = design_matrix @ coeff
-        rmse_flat[i] = float(np.sqrt(np.mean((pixel - recon) ** 2)))
+        target = np.append(pixel, fcls_weight) if use_fcls else pixel
+        coeff, _ = nnls(solver_matrix, target)
         total = coeff.sum()
         if total > 1e-8:
             abundances[i] = coeff / total
+
+        recon = (
+            design_matrix @ abundances[i].astype(np.float64)
+            if use_fcls
+            else design_matrix @ coeff
+        )
+        rmse_flat[i] = float(np.sqrt(np.mean((pixel - recon) ** 2)))
 
     return (
         abundances.reshape(h, w, n_endmembers),
@@ -363,7 +471,6 @@ def unmix_nnls(
     endmember_ids: dict[str, int] | None = None,
     n_endmembers: int = 4,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """Solves bounded non-negative least squares using labeled or ATGP endmembers."""
     h, w, c = cube.shape
 
     if gt_train is not None and np.any(gt_train > 0):
@@ -424,7 +531,6 @@ def train_olci_red_edge_estimator(
     gt: np.ndarray,
     target_names: tuple[str, ...] = ("Band_Depth", "Absorption_Area", "REIP_nm"),
 ) -> tuple[Pipeline, dict[str, float]]:
-    """Trains a regressor mapping multispectral bands to continuous hyperspectral metrics."""
     gt_train, gt_val, _ = split_spatial_gt(gt, train_frac=0.75)
 
     train_mask = gt_train.reshape(-1) > 0
@@ -512,232 +618,118 @@ def run_benchmark(
     return scores
 
 
-def _insert_nan_at_spectral_gaps(
-    wavelengths: np.ndarray, spectra: np.ndarray, max_step_nm: float = 35.0
-) -> tuple[np.ndarray, np.ndarray]:
-    gap_indices = np.nonzero(np.diff(wavelengths) > max_step_nm)[0] + 1
-    if gap_indices.size == 0:
-        return wavelengths, spectra
-
-    wl_plot = np.insert(wavelengths.astype(np.float64), gap_indices, np.nan)
-    spec_plot = np.insert(spectra.astype(np.float64), gap_indices, np.nan, axis=-1)
-    return wl_plot, spec_plot
-
-
-def plot_spectroscopy_summary(
+def run_spectral_analysis(
+    data: np.ndarray,
     wavelengths: np.ndarray,
-    endmembers: np.ndarray,
-    window_results: dict[str, dict[str, np.ndarray]],
-    rmse_map: np.ndarray,
-    out_path: Path,
-    convolved_centers: np.ndarray | None = None,
-    convolved_endmembers: np.ndarray | None = None,
-    sensor_name: str | None = None,
-) -> None:
-    """Renders a 4-panel physical spectroscopy and unmixing summary figure."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
-
-    wl_plot, em_plot = _insert_nan_at_spectral_gaps(wavelengths, endmembers)
-
-    ax0 = axes[0, 0]
-    colors = ["#1b7837", "#d95f02", "#8c510a", "#2b5c8f", "#7570b3"]
-    for idx, spec in enumerate(em_plot):
-        col = colors[idx % len(colors)]
-        ax0.plot(wl_plot, spec, lw=1.6, color=col, label=f"ATGP Endmember {idx + 1}")
-        if convolved_centers is not None and convolved_endmembers is not None:
-            ax0.scatter(
-                convolved_centers,
-                convolved_endmembers[idx],
-                color=col,
-                s=28,
-                zorder=4,
-            )
-
-    title_a = "ATGP Autonomous Endmember Spectra"
-    if sensor_name:
-        title_a += f" (Dots: {sensor_name} Bandpass)"
-    ax0.set_title(title_a, fontsize=11)
-    ax0.set_xlabel("Wavelength (nm)")
-    ax0.set_ylabel("Surface Reflectance")
-    ax0.legend(loc="best", fontsize=8)
-    ax0.grid(True, alpha=0.3)
-
-    ax1 = axes[0, 1]
-    if "chlorophyll_red_edge" in window_results:
-        chl_depth = window_results["chlorophyll_red_edge"]["depth"]
-        im1 = ax1.imshow(chl_depth, cmap="YlGn", vmin=0.0, vmax=0.85)
-        plt.colorbar(
-            im1, ax=ax1, fraction=0.046, pad=0.04, label="Continuum Band Depth"
-        )
-        ax1.set_title("Chlorophyll Red-Edge Absorption Depth (670-760 nm)", fontsize=11)
-    ax1.axis("off")
-
-    ax2 = axes[1, 0]
-    if "clay_al_oh" in window_results:
-        clay_depth = window_results["clay_al_oh"]["depth"]
-        vmax_clay = max(float(np.percentile(clay_depth, 99)), 0.05)
-        im2 = ax2.imshow(clay_depth, cmap="OrRd", vmin=0.0, vmax=vmax_clay)
-        plt.colorbar(
-            im2, ax=ax2, fraction=0.046, pad=0.04, label="Al-OH Band Depth (~2200 nm)"
-        )
-        ax2.set_title("SWIR Clay Mineral Al-OH Absorption (2160-2240 nm)", fontsize=11)
-    elif "chlorophyll_red_edge" in window_results:
-        reip_map = window_results["chlorophyll_red_edge"]["reip_nm"]
-        chl_depth = window_results["chlorophyll_red_edge"]["depth"]
-        masked_reip = np.where(chl_depth > 0.15, reip_map, np.nan)
-        im2 = ax2.imshow(masked_reip, cmap="viridis", vmin=695.0, vmax=735.0)
-        plt.colorbar(
-            im2, ax=ax2, fraction=0.046, pad=0.04, label="REIP Wavelength (nm)"
-        )
-        ax2.set_title("Sub-Band Red-Edge Inflection Point (Veg Pixels)", fontsize=11)
-    ax2.axis("off")
-
-    ax3 = axes[1, 1]
-    vmax_rmse = max(float(np.percentile(rmse_map, 99)), 1e-3)
-    im3 = ax3.imshow(rmse_map, cmap="magma", vmin=0.0, vmax=vmax_rmse)
-    plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04, label="Spectral RMSE")
-    ax3.set_title("ATGP + NNLS Unmixing Residual (RMSE)", fontsize=11)
-    ax3.axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="VNIR-SWIR Continuum Spectroscopy, ATGP Unmixing, and Bandpass Simulation"
-    )
-    parser.add_argument(
-        "source",
-        nargs="?",
-        default="data/PaviaU.mat",
-        help="Path to PaviaU .mat file or an EnMAP L2A product directory",
-    )
-    parser.add_argument(
-        "--bbox",
-        nargs=4,
-        type=int,
-        default=None,
-        metavar=("R0", "R1", "C0", "C1"),
-        help="Spatial bounding box crop (row_min row_max col_min col_max)",
-    )
-    parser.add_argument(
-        "--endmembers",
-        type=int,
-        default=4,
-        help="Number of autonomous ATGP endmembers to extract (default: 4)",
-    )
-    parser.add_argument(
-        "--convolve",
-        choices=["s2", "s3"],
-        default=None,
-        help="Optional bandpass degradation to Sentinel-2 MSI (s2) or Sentinel-3 OLCI (s3)",
-    )
-    args = parser.parse_args()
-
-    source_path = Path(args.source)
-    is_enmap_dir = source_path.is_dir()
-    bbox = tuple(args.bbox) if args.bbox else None
-
-    data, gt, wavelengths, _ = load_scene(source_path, bbox=bbox)
-    valid_mask = np.any(data > 1e-4, axis=-1)
-    valid_count = int(np.sum(valid_mask))
-
-    print(f"\nScene:            {source_path.name}")
-    print(
-        f"Spatial grid:     {data.shape[0]} x {data.shape[1]} ({valid_count} valid pixels)"
-    )
-    print(
-        f"Spectral range:   {data.shape[2]} bands ({wavelengths[0]:.1f} - {wavelengths[-1]:.1f} nm)"
-    )
+    n_endmembers: int = 4,
+    convolve_sensor: str | None = None,
+    valid_mask: np.ndarray | None = None,
+) -> SpectroscopyResult:
+    if valid_mask is None:
+        valid_mask = np.any(data > 1e-4, axis=-1)
 
     window_results = analyze_diagnostic_windows(data, wavelengths)
-    print("\n--- Continuum-Removed Absorption Features (Sub-Band Parabolic Fit) ---")
-    for win_name, win_data in window_results.items():
-        depth_vals = win_data["depth"][valid_mask]
-        active = depth_vals > 0.05
-        mean_depth = float(depth_vals[active].mean()) if np.any(active) else 0.0
-        pos_key = "reip_nm" if "reip_nm" in win_data else "min_wavelength_nm"
-        pos_vals = win_data[pos_key][valid_mask]
-        mean_pos = float(pos_vals[active].mean()) if np.any(active) else 0.0
-        print(
-            f"  {win_name:<22} | Active Pixels: {int(np.sum(active)):>7} | "
-            f"Mean Depth: {mean_depth:5.3f} | Mean {pos_key}: {mean_pos:6.2f} nm"
-        )
-
     _, endmembers, rmse_map = unmix_scene_atgp(
-        data, n_endmembers=args.endmembers, valid_mask=valid_mask
-    )
-    mean_rmse = float(rmse_map[valid_mask].mean()) if valid_count > 0 else 0.0
-    print(
-        f"\nATGP + NNLS Unmixing ({args.endmembers} endmembers) | Mean Spectral RMSE: {mean_rmse:.4f}"
+        data, n_endmembers=n_endmembers, valid_mask=valid_mask
     )
 
     convolved_centers = None
     convolved_endmembers = None
     sensor_label = None
 
-    if args.convolve is not None:
-        srf_specs = SENSOR_SRF_SPECS[args.convolve]
-        sensor_label = "Sentinel-2 MSI" if args.convolve == "s2" else "Sentinel-3 OLCI"
+    if convolve_sensor is not None:
+        srf_specs = SENSOR_SRF_SPECS[convolve_sensor]
+        sensor_label = SENSOR_LABELS[convolve_sensor]
         srf_weights, convolved_centers = build_srf_weights(wavelengths, srf_specs)
-        convolved_cube = resample_cube(data, srf_weights)
         convolved_endmembers = endmembers @ srf_weights.T
 
-        print(f"\n--- Cross-Sensor Bandpass Simulation ({sensor_label}) ---")
-        target_layers = []
-        target_names_list = []
-
-        if "chlorophyll_red_edge" in window_results:
-            target_layers.append(window_results["chlorophyll_red_edge"]["depth"])
-            target_layers.append(window_results["chlorophyll_red_edge"]["reip_nm"])
-            target_names_list.extend(["Chl_Band_Depth", "REIP_nm"])
-
-        if "clay_al_oh" in window_results:
-            target_layers.append(window_results["clay_al_oh"]["depth"])
-            target_names_list.append("Clay_Al_OH_Depth")
-
-        if target_layers:
-            target_cube = np.stack(target_layers, axis=-1)
-            valid_gt = valid_mask.astype(np.int64)
-            _, r2_scores = train_olci_red_edge_estimator(
-                convolved_cube,
-                target_cube,
-                valid_gt,
-                target_names=tuple(target_names_list),
-            )
-            print(
-                f"{sensor_label} -> Hyperspectral Parameter Retrieval (Spatial Val R2):"
-            )
-            for m_name, score in r2_scores.items():
-                print(f"  {m_name:<22}: {score:6.3f}")
-
-        if not is_enmap_dir:
-            flat_pixels = data.reshape(-1, data.shape[-1])
-            re_metrics_flat, _, _ = compute_red_edge_metrics(flat_pixels, wavelengths)
-            re_metrics_cube = re_metrics_flat.reshape(data.shape[0], data.shape[1], 3)
-            run_benchmark(
-                data, convolved_cube, re_metrics_cube, gt, sensor_label=sensor_label
-            )
-
-    out_png = (
-        Path("outputs/enmap_spectroscopy_summary.png")
-        if is_enmap_dir
-        else Path("outputs/pavia_spectroscopy_summary.png")
-    )
-    plot_spectroscopy_summary(
+    return SpectroscopyResult(
         wavelengths=wavelengths,
         endmembers=endmembers,
         window_results=window_results,
         rmse_map=rmse_map,
-        out_path=out_png,
+        valid_mask=valid_mask,
         convolved_centers=convolved_centers,
         convolved_endmembers=convolved_endmembers,
         sensor_name=sensor_label,
     )
-    print(f"Summary figure saved to: {out_png}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Continuum Spectroscopy, ATGP Unmixing, and Bandpass Simulation"
+    )
+    parser.add_argument("source", nargs="?", default="data/PaviaU.mat")
+    parser.add_argument("--bbox", nargs=4, type=int, default=None)
+    parser.add_argument("--endmembers", type=int, default=4)
+    parser.add_argument(
+        "--convolve", choices=["s2", "s3", "metimage", "fci"], default=None
+    )
+    parser.add_argument("--snr-check", action="store_true")
+    parser.add_argument("--export-tif", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None)
+    args = parser.parse_args()
+
+    bbox = tuple(args.bbox) if args.bbox else None
+    scene = load_scene(args.source, bbox=bbox)
+    results = run_spectral_analysis(
+        scene.cube,
+        scene.wavelengths,
+        n_endmembers=args.endmembers,
+        convolve_sensor=args.convolve,
+        valid_mask=scene.valid_mask,
+    )
+
+    mean_rmse = float(results.rmse_map[results.valid_mask].mean())
+    print(
+        f"Scene: {Path(args.source).name} | Endmembers: {len(results.endmembers)} | "
+        f"Mean Unmixing RMSE: {mean_rmse:.4f}"
+    )
+
+    for win_name, win_data in results.window_results.items():
+        depths = win_data["depth"][results.valid_mask]
+        active = depths > 0.05
+        pos_key = "reip_nm" if "reip_nm" in win_data else "min_wavelength_nm"
+        mean_d = float(depths[active].mean()) if np.any(active) else 0.0
+        mean_w = (
+            float(win_data[pos_key][results.valid_mask][active].mean())
+            if np.any(active)
+            else 0.0
+        )
+        print(
+            f"  {win_name:<22} | Active: {int(np.sum(active)):>7} | "
+            f"Depth: {mean_d:5.3f} | {pos_key}: {mean_w:6.2f} nm"
+        )
+
+    if args.snr_check:
+        win = (2160.0, 2240.0) if scene.wavelengths[-1] >= 2240.0 else (670.0, 760.0)
+        snr_stats = evaluate_snr_sensitivity(
+            results.endmembers[0], scene.wavelengths, window_nm=win
+        )
+        for snr_val, st in snr_stats.items():
+            print(
+                f"  SNR {snr_val:5.0f}:1 | WL RMSE: {st['wavelength_rmse_nm']:5.3f} nm | "
+                f"Depth RMSE: {st['depth_rmse']:6.4f}"
+            )
+
+    if args.export_tif is not None:
+        layers = [results.rmse_map]
+        names = ["unmixing_rmse"]
+        if "chlorophyll_red_edge" in results.window_results:
+            layers.append(results.window_results["chlorophyll_red_edge"]["depth"])
+            layers.append(results.window_results["chlorophyll_red_edge"]["reip_nm"])
+            names.extend(["chlorophyll_depth", "reip_nm"])
+        if "clay_al_oh" in results.window_results:
+            layers.append(results.window_results["clay_al_oh"]["depth"])
+            names.append("clay_al_oh_depth")
+        export_geotiff(
+            args.export_tif, np.stack(layers, axis=-1), geo=scene.geo, band_names=names
+        )
+
+    if args.out is not None:
+        from .visualization import plot_spectroscopy_summary
+
+        plot_spectroscopy_summary(results, args.out)
 
 
 if __name__ == "__main__":
