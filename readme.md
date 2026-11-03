@@ -41,7 +41,7 @@ Spaceborne and airborne imaging spectrometers record contiguous reflectance spec
   <img src="./assets/enmap_spectroscopy_summary.png" alt="EnMAP VNIR-SWIR Spectroscopy and ATGP Unmixing" width="90%">
 </p>
 
-*Physical spectroscopy pipeline on an EnMAP L2A scene (Groningen / Wadden Sea): shape-normalized ATGP endmembers with convolved Sentinel-2 MSI bandpasses (top-left), continuum-removed chlorophyll red-edge depth (top-right), SWIR Al–OH clay mineral absorption depth at 2200 nm (bottom-left), and NNLS unmixing residual RMSE (bottom-right).*
+*Physical spectroscopy pipeline on an EnMAP L2A scene (Groningen / Wadden Sea): shape-normalized ATGP endmembers (top-left), continuum-removed chlorophyll red-edge depth (top-right), SWIR Al–OH clay mineral absorption depth at 2200 nm (bottom-left), and NNLS unmixing residual RMSE (bottom-right).*
 
 <p align="center">
   <img src="./assets/ssl_clusters_anomalies_10.png" alt="Self-Supervised Latent Clustering and Anomaly Detection" width="90%">
